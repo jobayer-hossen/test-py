@@ -171,7 +171,7 @@ if __name__ == '__main__':
 
     # Check if python version is new enough
     python_version: float = float(f'{sys.version_info.major}.{sys.version_info.minor}')
-    if python_version != settings.PYTHON_VERSION:
+    if python_version < settings.PYTHON_VERSION:
         error_message: str = (
             f'Navi requires Python {settings.PYTHON_VERSION} to run.\n'
             f'Your current version is {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}.'
