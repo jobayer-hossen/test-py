@@ -1,0 +1,2218 @@
+# components.py
+"""Contains global interaction components"""
+
+import asyncio
+import re
+from typing import Callable, Dict, Literal, Optional
+
+import discord
+
+from content import settings as settings_cmd
+from database import cooldowns, guilds, portals, reminders, users
+from database import settings as settings_db
+from resources import emojis, exceptions, functions, modals, settings, strings, views
+
+
+class ToggleAutoReadyButton(discord.ui.Button):
+    """Button to toggle the auto-ready feature"""
+    def __init__(self, custom_id: str, label: str, disabled: bool = False, emoji: Optional[discord.PartialEmoji] = None):
+        super().__init__(style=discord.ButtonStyle.grey, custom_id=custom_id, label=label, emoji=emoji,
+                         disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.custom_id == 'follow':
+            enabled = True
+            response = (
+                f'Done. I will now show you your ready commands after every created reminder.'
+            )
+        else:
+            enabled = False
+            response = 'Done. I will now stop showing your ready commands automatically.'
+        await self.view.user_settings.update(auto_ready_enabled=enabled)
+        self.view.value = self.custom_id
+        await self.view.user_settings.refresh()
+        if self.view.user_settings.auto_ready_enabled:
+            self.label = 'Stop following me!'
+            self.custom_id = 'unfollow'
+        else:
+            self.label = 'Follow me!'
+            self.custom_id = 'follow'
+        await self.view.message.edit(view=self.view)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(response, ephemeral=True)
+        else:
+            await interaction.followup.send(response, ephemeral=True)
+
+
+class ReadyGoBackButton(discord.ui.Button):
+    """Button to return to ready settings"""
+    def __init__(self, view: discord.ui.DesignerView, custom_id: str, label: str, disabled: bool = False, emoji: Optional[discord.PartialEmoji] = None):
+        super().__init__(style=discord.ButtonStyle.grey, custom_id=custom_id, label=label, emoji=emoji,
+                         disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view.ready_view(self.view.ctx, self.view.bot, self.view.user_settings, self.view.clan_settings,
+                                    settings_cmd.embed_settings_ready)
+        embed = await settings_cmd.embed_settings_ready(self.view.bot, self.view.ctx, self.view.user_settings, self.view.clan_settings)
+        await interaction.response.edit_message(embed=embed, view=view)
+        view.interaction = interaction
+        self.view.stop()
+            
+
+class CustomButton(discord.ui.Button):
+    """Simple Button. Writes its custom id to the view value, stops the view and does an invisible response."""
+    def __init__(self, style: discord.ButtonStyle, custom_id: str, label: Optional[str],
+                 emoji: Optional[discord.PartialEmoji] = None):
+        super().__init__(style=style, custom_id=custom_id, label=label, emoji=emoji)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.value = self.custom_id
+        self.view.stop()
+        try:
+            await interaction.response.send_message()
+        except Exception:
+            pass
+
+
+class TrainingButton(discord.ui.Button):
+    """Disabled button with no callback"""
+    def __init__(self, style: discord.ButtonStyle, label: str, row: int, disabled: bool, emoji: Optional[discord.PartialEmoji] = None):
+        super().__init__(style=style, label=label, emoji=emoji, disabled=disabled, row=row)
+
+
+class ToggleUserSettingsSelect(discord.ui.Select):
+    """Toggle select that shows and toggles the status of user settings (except alerts)."""
+    def __init__(self, view: discord.ui.DesignerView, toggled_settings: Dict[str, str], placeholder: str,
+                 custom_id: Optional[str] = 'toggle_user_settings'):
+        self.toggled_settings = toggled_settings
+        options = []
+        options.append(discord.SelectOption(label='Enable all', value='enable_all', emoji=None))
+        options.append(discord.SelectOption(label='Disable all', value='disable_all', emoji=None))
+        for label, setting in toggled_settings.items():
+            setting_enabled = getattr(view.user_settings, setting)
+            if isinstance(setting_enabled, users.UserAlert):
+                setting_enabled = getattr(setting_enabled, 'enabled')
+            emoji = emojis.ENABLED if setting_enabled else emojis.DISABLED
+            options.append(discord.SelectOption(label=label, value=setting, emoji=emoji))
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options,
+                         custom_id=custom_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        updated_settings = {}
+        if select_value in ('enable_all','disable_all'):
+            enabled = True if select_value == 'enable_all' else False
+            for setting in self.toggled_settings.values():
+                if not setting.endswith('_enabled'):
+                    setting = f'{setting}_enabled'
+                updated_settings[setting] = enabled
+        else:
+            setting_value = getattr(self.view.user_settings, select_value)
+            if isinstance(setting_value, users.UserAlert):
+                setting_value = getattr(setting_value, 'enabled')
+            if not select_value.endswith('_enabled'):
+                select_value = f'{select_value}_enabled'
+            updated_settings[select_value] = not setting_value
+        await self.view.user_settings.update(**updated_settings)
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if child.custom_id == self.custom_id:
+                    options = []
+                    options.append(discord.SelectOption(label='Enable all', value='enable_all', emoji=None))
+                    options.append(discord.SelectOption(label='Disable all', value='disable_all', emoji=None))
+                    for label, setting in self.toggled_settings.items():
+                        setting_enabled = getattr(self.view.user_settings, setting)
+                        if isinstance(setting_enabled, users.UserAlert):
+                            setting_enabled = getattr(setting_enabled, 'enabled')
+                        emoji = emojis.ENABLED if setting_enabled else emojis.DISABLED
+                        options.append(discord.SelectOption(label=label, value=setting, emoji=emoji))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+class ToggleServerSettingsSelect(discord.ui.Select):
+    """Toggle select that shows and toggles the status of server settings."""
+    def __init__(self, view: discord.ui.DesignerView, toggled_settings: Dict[str, str], placeholder: str,
+                 custom_id: Optional[str] = 'toggle_server_settings'):
+        self.toggled_settings = toggled_settings
+        options = []
+        options.append(discord.SelectOption(label='Enable all', value='enable_all', emoji=None))
+        options.append(discord.SelectOption(label='Disable all', value='disable_all', emoji=None))
+        for label, setting in toggled_settings.items():
+            setting_enabled = getattr(view.guild_settings, setting)
+            if isinstance(setting_enabled, guilds.EventPing):
+                setting_enabled = getattr(setting_enabled, 'enabled')
+            emoji = emojis.ENABLED if setting_enabled else emojis.DISABLED
+            options.append(discord.SelectOption(label=label, value=setting, emoji=emoji))
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options,
+                         custom_id=custom_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        updated_settings = {}
+        if select_value in ('enable_all','disable_all'):
+            enabled = True if select_value == 'enable_all' else False
+            for setting in self.toggled_settings.values():
+                if not setting.endswith('_enabled'):
+                    setting = f'{setting}_enabled'
+                updated_settings[setting] = enabled
+        else:
+            setting_value = getattr(self.view.guild_settings, select_value)
+            if isinstance(setting_value, guilds.EventPing):
+                setting_value = getattr(setting_value, 'enabled')
+            if not select_value.endswith('_enabled'):
+                select_value = f'{select_value}_enabled'
+            updated_settings[select_value] = not setting_value
+        await self.view.guild_settings.update(**updated_settings)
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if child.custom_id == self.custom_id:
+                    options = []
+                    options.append(discord.SelectOption(label='Enable all', value='enable_all', emoji=None))
+                    options.append(discord.SelectOption(label='Disable all', value='disable_all', emoji=None))
+                    for label, setting in self.toggled_settings.items():
+                        setting_enabled = getattr(self.view.guild_settings, setting)
+                        if isinstance(setting_enabled, guilds.EventPing):
+                            setting_enabled = getattr(setting_enabled, 'enabled')
+                        emoji = emojis.ENABLED if setting_enabled else emojis.DISABLED
+                        options.append(discord.SelectOption(label=label, value=setting, emoji=emoji))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.guild_settings)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+        
+class ToggleEventPingsSelect(discord.ui.Select):
+    """Toggle select that shows and toggles event pings."""
+    def __init__(self, view: discord.ui.DesignerView, toggled_settings: Dict[str, str], placeholder: str,
+                 custom_id: Optional[str] = 'toggle_event_pings_settings'):
+        self.toggled_settings = toggled_settings
+        options = []
+        options.append(discord.SelectOption(label='Enable all', value='enable_all', emoji=None))
+        options.append(discord.SelectOption(label='Disable all', value='disable_all', emoji=None))
+        for label, setting in toggled_settings.items():
+            setting_enabled = getattr(view.guild_settings, setting)
+            if isinstance(setting_enabled, guilds.EventPing):
+                setting_enabled = getattr(setting_enabled, 'enabled')
+            emoji = emojis.ENABLED if setting_enabled else emojis.DISABLED
+            options.append(discord.SelectOption(label=label, value=setting, emoji=emoji))
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options,
+                         custom_id=custom_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        updated_settings = {}
+        if select_value in ('enable_all','disable_all'):
+            enabled = True if select_value == 'enable_all' else False
+            if enabled:
+                channel_permissions = self.view.ctx.channel.permissions_for(self.view.ctx.guild.me)
+                if not channel_permissions.mention_everyone:
+                    await interaction.response.send_message(
+                        f'Enabling event pings requires Epic Navi to have the `Mention everyone, here and all roles` '
+                        f'permission first.',
+                        ephemeral=True
+                    )
+                    return
+            for setting in self.toggled_settings.values():
+                if not setting.endswith('_enabled'):
+                    setting = f'{setting}_enabled'
+                updated_settings[setting] = enabled
+        else:
+            setting_value = getattr(self.view.guild_settings, select_value)
+            if isinstance(setting_value, guilds.EventPing):
+                setting_value = getattr(setting_value, 'enabled')
+            if not select_value.endswith('_enabled'):
+                select_value = f'{select_value}_enabled'
+            updated_settings[select_value] = not setting_value
+            if not setting_value == True:
+                channel_permissions = self.view.ctx.channel.permissions_for(self.view.ctx.guild.me)
+                if not channel_permissions.mention_everyone:
+                    await interaction.response.send_message(
+                        f'Enabling event pings requires Epic Navi to have the `Mention everyone, here and all roles` '
+                        f'permission first.',
+                        ephemeral=True
+                    )
+                    return
+        await self.view.guild_settings.update(**updated_settings)
+        for action_row in self.view.children.copy():
+            for child in action_row.children:
+                if child.custom_id == self.custom_id:
+                    options = []
+                    options.append(discord.SelectOption(label='Enable all', value='enable_all', emoji=None))
+                    options.append(discord.SelectOption(label='Disable all', value='disable_all', emoji=None))
+                    for label, setting in self.toggled_settings.items():
+                        setting_enabled = getattr(self.view.guild_settings, setting)
+                        if isinstance(setting_enabled, guilds.EventPing):
+                            setting_enabled = getattr(setting_enabled, 'enabled')
+                        emoji = emojis.ENABLED if setting_enabled else emojis.DISABLED
+                    options.append(discord.SelectOption(label=label, value=setting, emoji=emoji))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.guild_settings)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ToggleReadySettingsSelect(discord.ui.Select):
+    """Toggle select that shows and toggles the status of ready settings."""
+    def __init__(self, view: discord.ui.DesignerView, toggled_settings: Dict[str, str], placeholder: str,
+                 custom_id: Optional[str] = 'toggle_ready_settings'):
+        self.toggled_settings = toggled_settings
+        options = []
+        options.append(discord.SelectOption(label='Show all', value='enable_all', emoji=None))
+        options.append(discord.SelectOption(label='Hide all', value='disable_all', emoji=None))
+        for label, setting in toggled_settings.items():
+            setting_enabled = getattr(view.user_settings, setting)
+            if isinstance(setting_enabled, users.UserAlert):
+                setting_enabled = getattr(setting_enabled, 'visible')
+            emoji = emojis.ENABLED if setting_enabled else emojis.DISABLED
+            options.append(discord.SelectOption(label=label, value=setting, emoji=emoji))
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options,
+                         custom_id=custom_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        updated_settings = {}
+        if select_value in ('enable_all','disable_all'):
+            enabled = True if select_value == 'enable_all' else False
+            for setting in self.toggled_settings.values():
+                if not setting.endswith('_visible'):
+                    setting = f'{setting}_visible'
+                updated_settings[setting] = enabled
+        else:
+            setting_value = getattr(self.view.user_settings, select_value)
+            if isinstance(setting_value, users.UserAlert):
+                setting_value = getattr(setting_value, 'visible')
+            if not select_value.endswith('_visible'):
+                select_value = f'{select_value}_visible'
+            updated_settings[select_value] = not setting_value
+        await self.view.user_settings.update(**updated_settings)
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if child.custom_id == self.custom_id:
+                    options = []
+                    options.append(discord.SelectOption(label='Show all', value='enable_all', emoji=None))
+                    options.append(discord.SelectOption(label='Hide all', value='disable_all', emoji=None))
+                    for label, setting in self.toggled_settings.items():
+                        setting_enabled = getattr(self.view.user_settings, setting)
+                        if isinstance(setting_enabled, users.UserAlert):
+                            setting_enabled = getattr(setting_enabled, 'visible')
+                        emoji = emojis.ENABLED if setting_enabled else emojis.DISABLED
+                        options.append(discord.SelectOption(label=label, value=setting, emoji=emoji))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings, self.view.clan_settings)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ManageClanSettingsSelect(discord.ui.Select):
+    """Select to change guild settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        reminder_emoji = emojis.ENABLED if view.clan_settings.alert_enabled else emojis.DISABLED
+        quest_emoji = emojis.ENABLED if view.clan_settings.upgrade_quests_enabled else emojis.DISABLED
+        options.append(discord.SelectOption(label=f'Reminder',
+                                            value='toggle_reminder', emoji=reminder_emoji))
+        options.append(discord.SelectOption(label=f'Quests below stealth threshold',
+                                            value='toggle_quest', emoji=quest_emoji))
+        options.append(discord.SelectOption(label='Change stealth threshold',
+                                            value='set_threshold'))
+        options.append(discord.SelectOption(label='Add this channel as guild channel',
+                                            value='set_channel', emoji=emojis.ADD))
+        options.append(discord.SelectOption(label='Remove guild channel',
+                                            value='reset_channel', emoji=emojis.REMOVE))
+        if (view.clan_settings.quest_user_id is not None
+            and view.clan_settings.quest_user_id == view.ctx.author.id):
+            options.append(discord.SelectOption(label='Remove guild quest',
+                                                value='remove_clan_quest', emoji=emojis.REMOVE))
+        super().__init__(placeholder='Change settings', min_values=1, max_values=1, options=options,
+                         custom_id='manage_clan_settings')
+
+    async def callback(self, interaction: discord.Interaction):
+        clan_leader_ids: list[int] = []
+        for clan_member in self.view.clan_settings.members:
+            if clan_member.member_type == 'leader':
+                clan_leader_ids.append(clan_member.user_id)
+        user_global_name = interaction.user.global_name if interaction.user.global_name is not None else interaction.user.name
+        if interaction.user.id not in clan_leader_ids:
+            await interaction.response.send_message(
+                f'**{user_global_name}**, you are not registered as a guild leader. Only guild leaders can '
+                f'change these settings.\n'
+                f'If you _are_ a guild leader, run {strings.SLASH_COMMANDS["guild list"]} to update '
+                f'your guild in my database.\n',
+                ephemeral=True
+            )
+            return
+        select_value = self.values[0]
+        if select_value == 'toggle_reminder':
+            if not self.view.clan_settings.alert_enabled and self.view.clan_settings.channel_id is None:
+                await interaction.response.send_message('You need to set a guild channel first.', ephemeral=True)
+                return
+            await self.view.clan_settings.update(alert_enabled=not self.view.clan_settings.alert_enabled)
+        elif select_value == 'toggle_quest':
+            await self.view.clan_settings.update(upgrade_quests_enabled=not self.view.clan_settings.upgrade_quests_enabled)
+        elif select_value == 'set_threshold':
+            modal = modals.SetStealthThresholdModal(self.view)
+            await interaction.response.send_modal(modal)
+            return
+        elif select_value == 'set_channel':
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.blurple, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, do you want to set `{interaction.channel.name}` as the alert channel '
+                f'for the guild `{self.view.clan_settings.clan_name}`?',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                await self.view.clan_settings.update(channel_id=interaction.channel.id)
+                await confirm_interaction.edit_original_response(content='Channel updated.', view=None)
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        elif select_value == 'reset_channel':
+            if self.view.clan_settings.channel_id is None:
+                await interaction.response.send_message(
+                    f'You don\'t have a guild channel set.',
+                    ephemeral=True
+                )
+                return
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.red, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, do you want to reset the guild alert channel '
+                f'for the guild `{self.view.clan_settings.clan_name}`?\n\n'
+                f'Note that this will also disable the reminder if enabled.',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                await self.view.clan_settings.update(channel_id=None, alert_enabled=False)
+                await confirm_interaction.edit_original_response(content='Channel reset.', view=None)
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        elif select_value == 'remove_clan_quest':
+            await self.view.clan_settings.update(quest_user_id=None)
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, ManageClanSettingsSelect):
+                    options = []
+                    reminder_emoji = emojis.ENABLED if self.view.clan_settings.alert_enabled else emojis.DISABLED
+                    quest_emoji = emojis.ENABLED if self.view.clan_settings.upgrade_quests_enabled else emojis.DISABLED
+                    options.append(discord.SelectOption(label=f'Reminder',
+                                                        value='toggle_reminder', emoji=reminder_emoji))
+                    options.append(discord.SelectOption(label=f'Quests below stealth threshold',
+                                                        value='toggle_quest', emoji=quest_emoji))
+                    options.append(discord.SelectOption(label='Change stealth threshold',
+                                                        value='set_threshold'))
+                    options.append(discord.SelectOption(label='Add this channel as guild channel',
+                                                        value='set_channel', emoji=emojis.ADD))
+                    options.append(discord.SelectOption(label='Remove guild channel',
+                                                        value='reset_channel', emoji=emojis.REMOVE))
+                    if (self.view.clan_settings.quest_user_id is not None
+                        and self.view.clan_settings.quest_user_id == self.view.ctx.author.id):
+                        options.append(discord.SelectOption(label='Remove guild quest',
+                                                            value='remove_clan_quest', emoji=emojis.REMOVE))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.clan_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ManageReadySettingsSelect(discord.ui.Select):
+    """Select to change ready settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        frequency = 'hunt only' if view.user_settings.ready_after_all_commands else 'all commands'
+        message_style = 'embed' if view.user_settings.ready_as_embed else 'normal message'
+        user_ping_emoji = emojis.ENABLED if view.user_settings.ready_ping_user else emojis.DISABLED
+        trade_daily_emoji = emojis.ENABLED if view.user_settings.ready_trade_daily_visible else emojis.DISABLED
+        eternity_emoji = emojis.ENABLED if view.user_settings.ready_eternity_visible else emojis.DISABLED
+        trade_daily_done_emoji = emojis.ENABLED if view.user_settings.ready_trade_daily_completed_visible else emojis.DISABLED
+        up_next_reminder_emoji = emojis.ENABLED if view.user_settings.ready_up_next_visible else emojis.DISABLED
+        up_next_style = 'static time' if view.user_settings.ready_up_next_as_timestamp else 'timestamp'
+        if view.user_settings.ready_pets_claim_after_every_pet:
+            pets_claim_type = 'when all pets are back'
+        else:
+            pets_claim_type = 'after every pet'
+        if view.user_settings.ready_up_next_show_hidden_reminders:
+            up_next_hidden_emoji = emojis.ENABLED
+        else:
+            up_next_hidden_emoji = emojis.DISABLED
+        auto_ready_emoji = emojis.ENABLED if view.user_settings.auto_ready_enabled else emojis.DISABLED
+        other_position = 'on bottom' if view.user_settings.ready_other_on_top else 'on top'
+        options.append(discord.SelectOption(label=f'Auto-ready',
+                                            value='toggle_auto_ready', emoji=auto_ready_emoji))
+        if not settings.LITE_MODE:
+            options.append(discord.SelectOption(label=f'Show auto-ready after {frequency}',
+                                                value='toggle_frequency', emoji=None))
+        options.append(discord.SelectOption(label='Auto-ready ping',
+                                            value='toggle_user_ping', emoji=user_ping_emoji))
+        options.append(discord.SelectOption(label=f'Show ready commands as {message_style}',
+                                            value='toggle_message_style', emoji=None))
+        options.append(discord.SelectOption(label='Change embed color',
+                                            value='change_embed_color', emoji=None))
+        if view.clan_settings is not None:
+            clan_reminder_action = 'Hide' if view.clan_settings.alert_visible else 'Show'
+            options.append(discord.SelectOption(label=f'{clan_reminder_action} guild channel reminder',
+                                                value='toggle_alert'))
+        options.append(discord.SelectOption(label=f'Show "/pets claim" {pets_claim_type}',
+                                                value='toggle_pets_claim'))
+        options.append(discord.SelectOption(label=f'Show "other commands" {other_position}',
+                                            value='toggle_other_position', emoji=None))
+        options.append(discord.SelectOption(label=f'Eternity time left',
+                                            value='toggle_eternity_visible', emoji=eternity_emoji))
+        options.append(discord.SelectOption(label='Daily trades',
+                                            value='toggle_trade_daily', emoji=trade_daily_emoji))
+        options.append(discord.SelectOption(label='Daily trades when done',
+                                            value='toggle_trade_done', emoji=trade_daily_done_emoji))
+        options.append(discord.SelectOption(label='"Up next" reminder',
+                                            value='toggle_up_next', emoji=up_next_reminder_emoji))
+        options.append(discord.SelectOption(label=f'Show "up next" reminder with {up_next_style}',
+                                            value='toggle_up_next_timestamp'))
+        options.append(discord.SelectOption(label='Hidden reminders in "up next"',
+                                            value='toggle_up_next_hidden_reminders', emoji=up_next_hidden_emoji))
+        super().__init__(placeholder='Change settings', min_values=1, max_values=1, options=options,
+                         custom_id='manage_ready_settings')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        if select_value == 'toggle_auto_ready':
+            await self.view.user_settings.update(auto_ready_enabled=not self.view.user_settings.auto_ready_enabled)
+        elif select_value == 'toggle_alert':
+            await self.view.clan_settings.update(alert_visible=not self.view.clan_settings.alert_visible)
+        elif select_value == 'toggle_frequency':
+            await self.view.user_settings.update(
+                ready_after_all_commands=not self.view.user_settings.ready_after_all_commands
+            )
+        elif select_value == 'toggle_message_style':
+            await self.view.user_settings.update(ready_as_embed=not self.view.user_settings.ready_as_embed)
+        elif select_value == 'change_embed_color':
+            modal = modals.SetEmbedColorModal(self.view)
+            await interaction.response.send_modal(modal)
+            return
+        elif select_value == 'toggle_user_ping':
+            await self.view.user_settings.update(
+                ready_ping_user=not self.view.user_settings.ready_ping_user
+            )
+        elif select_value == 'toggle_trade_daily':
+            await self.view.user_settings.update(
+                ready_trade_daily_visible=not self.view.user_settings.ready_trade_daily_visible
+            )
+        elif select_value == 'toggle_trade_done':
+            await self.view.user_settings.update(
+                ready_trade_daily_completed_visible=not self.view.user_settings.ready_trade_daily_completed_visible
+            )
+        elif select_value == 'toggle_up_next':
+            await self.view.user_settings.update(
+                ready_up_next_visible=not self.view.user_settings.ready_up_next_visible
+            )
+        elif select_value == 'toggle_up_next_timestamp':
+            await self.view.user_settings.update(
+                ready_up_next_as_timestamp=not self.view.user_settings.ready_up_next_as_timestamp
+            )
+        elif select_value == 'toggle_up_next_hidden_reminders':
+            await self.view.user_settings.update(
+                ready_up_next_show_hidden_reminders=not self.view.user_settings.ready_up_next_show_hidden_reminders
+            )
+        elif select_value == 'toggle_other_position':
+            await self.view.user_settings.update(ready_other_on_top=not self.view.user_settings.ready_other_on_top)
+        elif select_value == 'toggle_eternity_visible':
+            await self.view.user_settings.update(ready_eternity_visible=not self.view.user_settings.ready_eternity_visible)
+        elif select_value == 'toggle_pets_claim':
+            await self.view.user_settings.update(
+                ready_pets_claim_after_every_pet=not self.view.user_settings.ready_pets_claim_after_every_pet
+            )
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, ManageReadySettingsSelect):
+                    options = []
+                    frequency = 'hunt only' if self.view.user_settings.ready_after_all_commands else 'all commands'
+                    message_style = 'embed' if self.view.user_settings.ready_as_embed else 'normal message'
+                    user_ping_emoji = emojis.ENABLED if self.view.user_settings.ready_ping_user else emojis.DISABLED
+                    trade_daily_emoji = emojis.ENABLED if self.view.user_settings.ready_trade_daily_visible else emojis.DISABLED
+                    eternity_emoji = emojis.ENABLED if self.view.user_settings.ready_eternity_visible else emojis.DISABLED
+                    trade_daily_done_emoji = emojis.ENABLED if self.view.user_settings.ready_trade_daily_completed_visible else emojis.DISABLED
+                    up_next_reminder_emoji = emojis.ENABLED if self.view.user_settings.ready_up_next_visible else emojis.DISABLED
+                    up_next_style = 'static time' if self.view.user_settings.ready_up_next_as_timestamp else 'timestamp'
+                    if self.view.user_settings.ready_pets_claim_after_every_pet:
+                        pets_claim_type = 'when all pets are back'
+                    else:
+                        pets_claim_type = 'after every pet'
+                    if self.view.user_settings.ready_up_next_show_hidden_reminders:
+                        up_next_hidden_emoji = emojis.ENABLED
+                    else:
+                        up_next_hidden_emoji = emojis.DISABLED
+                    auto_ready_emoji = emojis.ENABLED if self.view.user_settings.auto_ready_enabled else emojis.DISABLED
+                    other_position = 'on bottom' if self.view.user_settings.ready_other_on_top else 'on top'
+                    options.append(discord.SelectOption(label=f'Auto-ready',
+                                                        value='toggle_auto_ready', emoji=auto_ready_emoji))
+                    if not settings.LITE_MODE:
+                        options.append(discord.SelectOption(label=f'Show auto-ready after {frequency}',
+                                                            value='toggle_frequency', emoji=None))
+                    options.append(discord.SelectOption(label='Auto-ready ping',
+                                                        value='toggle_user_ping', emoji=user_ping_emoji))
+                    options.append(discord.SelectOption(label=f'Show ready commands as {message_style}',
+                                                        value='toggle_message_style', emoji=None))
+                    options.append(discord.SelectOption(label='Change embed color',
+                                                        value='change_embed_color', emoji=None))
+                    if self.view.clan_settings is not None:
+                        clan_reminder_action = 'Hide' if self.view.clan_settings.alert_visible else 'Show'
+                        options.append(discord.SelectOption(label=f'{clan_reminder_action} guild channel reminder',
+                                                            value='toggle_alert'))
+                    options.append(discord.SelectOption(label=f'Show "/pets claim" {pets_claim_type}',
+                                                            value='toggle_pets_claim'))
+                    options.append(discord.SelectOption(label=f'Show "other commands" {other_position}',
+                                                        value='toggle_other_position', emoji=None))
+                    options.append(discord.SelectOption(label=f'Eternity time left',
+                                                        value='toggle_eternity_visible', emoji=eternity_emoji))
+                    options.append(discord.SelectOption(label='Daily trades',
+                                                        value='toggle_trade_daily', emoji=trade_daily_emoji))
+                    options.append(discord.SelectOption(label='Daily trades when done',
+                                                        value='toggle_trade_done', emoji=trade_daily_done_emoji))
+                    options.append(discord.SelectOption(label='"Up next" reminder',
+                                                        value='toggle_up_next', emoji=up_next_reminder_emoji))
+                    options.append(discord.SelectOption(label=f'Show "up next" reminder with {up_next_style}',
+                                                        value='toggle_up_next_timestamp'))
+                    options.append(discord.SelectOption(label='Hidden reminders in "up next"',
+                                                        value='toggle_up_next_hidden_reminders', emoji=up_next_hidden_emoji))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings,
+                                               self.view.clan_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class SwitchReadyAltSelect(discord.ui.Select):
+    """Select to switch between alts in /ready"""
+    def __init__(self, view: discord.ui.DesignerView):
+        emoji = emojis.BP if view.user.id == view.active_alt_id else None
+        user_global_name = view.user.global_name if view.user.global_name is not None else view.user.name
+        options = [discord.SelectOption(label=user_global_name, value=str(view.user.id), emoji=emoji),]
+        for alt_id in view.user_settings.alts:
+            alt = view.bot.get_user(alt_id)
+            label = str(alt_id)
+            if alt is not None:
+                alt_name = alt.global_name if alt.global_name is not None else alt.name
+            else:
+                alt_name = label
+            emoji = emojis.BP if alt_id == view.active_alt_id else None
+            options.append(discord.SelectOption(label=label, value=str(alt_id), emoji=emoji))
+        super().__init__(placeholder='➜ Switch alt', min_values=1, max_values=1,
+                         options=options,
+                         custom_id='switch_alt')
+
+    async def callback(self, interaction: discord.Interaction):
+        alt_id = int(self.values[0])
+        self.view.active_alt_id = alt_id
+        alt = await functions.get_discord_user(self.view.bot, alt_id)
+        embed, content = await self.view.embed_function(self.view.bot, alt, False)
+        if self.view.user_settings.ready_as_embed:
+            content = None
+        else:
+            embed = None
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, SwitchReadyAltSelect):
+                    emoji = emojis.BP if self.view.user.id == self.view.active_alt_id else None
+                    user_global_name = self.view.user.global_name if self.view.user.global_name is not None else self.view.user.name
+                    options = [discord.SelectOption(label=user_global_name, value=str(self.view.user.id), emoji=emoji),]
+                    for alt_id in self.view.user_settings.alts:
+                        alt = self.view.bot.get_user(alt_id)
+                        label = str(alt_id)
+                        if alt is not None:
+                            alt_name = alt.global_name if alt.global_name is not None else alt.name
+                        else:
+                            alt_name = label
+                        emoji = emojis.BP if alt_id == self.view.active_alt_id else None
+                        options.append(discord.SelectOption(label=label, value=str(alt_id), emoji=emoji))
+                        child.options = options
+        if interaction.response.is_done():
+            await interaction.message.edit(content=content, embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(content=content, embed=embed, view=self.view)
+
+
+class SwitchStatsAltSelect(discord.ui.Select):
+    """Select to switch between alts in /stats"""
+    def __init__(self, view: discord.ui.DesignerView):
+        emoji = emojis.BP if view.user.id == view.active_alt_id else None
+        user_global_name = view.user.global_name if view.user.global_name is not None else view.user.name
+        options = [discord.SelectOption(label=user_global_name, value=str(view.user.id), emoji=emoji),]
+        for alt_id in view.user_settings.alts:
+            alt = view.bot.get_user(alt_id)
+            label = str(alt_id)
+            if alt is not None:
+                alt_name = alt.global_name if alt.global_name is not None else alt.name
+            else:
+                alt_name = label
+            emoji = emojis.BP if alt_id == view.active_alt_id else None
+            options.append(discord.SelectOption(label=label, value=str(alt_id), emoji=emoji))
+        super().__init__(placeholder='➜ Switch alt', min_values=1, max_values=1,
+                         options=options, custom_id='switch_alt')
+
+    async def callback(self, interaction: discord.Interaction):
+        alt_id = int(self.values[0])
+        self.view.active_alt_id = alt_id
+        alt = await functions.get_discord_user(self.view.bot, alt_id)
+        embed = await self.view.embed_function(self.view.bot, alt, self.view.time_left)
+        for action_row in self.view.children.copy():
+            for child in action_row.children:
+                if isinstance(child, SwitchStatsAltSelect):
+                    emoji = emojis.BP if self.view.user.id == self.view.active_alt_id else None
+                    user_global_name = self.view.user.global_name if self.view.user.global_name is not None else self.view.user.name
+                    options = [discord.SelectOption(label=user_global_name, value=str(self.view.user.id), emoji=emoji),]
+                    for alt_id in self.view.user_settings.alts:
+                        alt = self.view.bot.get_user(alt_id)
+                        label = str(alt_id)
+                        if alt is not None:
+                            alt_name = alt.global_name if alt.global_name is not None else alt.name
+                        else:
+                            alt_name = label
+                        emoji = emojis.BP if alt_id == self.view.active_alt_id else None
+                        options.append(discord.SelectOption(label=label, value=str(alt_id), emoji=emoji))
+                    child.options = options
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class SwitchRemindersListAltSelect(discord.ui.Select):
+    """Select to switch between alts in /list"""
+    def __init__(self, view: discord.ui.DesignerView):
+        emoji = emojis.BP if view.user.id == view.active_alt_id else None
+        user_global_name = view.user.global_name if view.user.global_name is not None else view.user.name
+        options = [discord.SelectOption(label=user_global_name, value=str(view.user.id), emoji=emoji),]
+        for alt_id in view.user_settings.alts:
+            alt = view.bot.get_user(alt_id)
+            label = str(alt_id)
+            if alt is not None:
+                alt_name = alt.global_name if alt.global_name is not None else alt.name
+            else:
+                alt_name = label
+            emoji = emojis.BP if alt_id == view.active_alt_id else None
+            options.append(discord.SelectOption(label=label, value=str(alt_id), emoji=emoji))
+        super().__init__(placeholder='➜ Switch alt', min_values=1, max_values=1,
+                         options=options, custom_id='switch_alt')
+
+    async def callback(self, interaction: discord.Interaction):
+        alt_id = int(self.values[0])
+        self.view.active_alt_id = alt_id
+        alt = await functions.get_discord_user(self.view.bot, alt_id)
+        embed = await self.view.embed_function(self.view.bot, alt, self.view.show_timestamps)
+        for action_row in self.view.children.copy():
+            for child in action_row.children:
+                if isinstance(child, (DeleteCustomReminderSelect)):
+                    if alt != self.view.user:
+                        child.disabled = True
+                    elif alt == self.view.user and self.view.custom_reminders:
+                        child.disabled = False
+                if isinstance(child, SwitchRemindersListAltSelect):
+                    emoji = emojis.BP if self.view.user.id == self.view.active_alt_id else None
+                    user_global_name = self.view.user.global_name if self.view.user.global_name is not None else self.view.user.name
+                    options = [discord.SelectOption(label=user_global_name, value=str(self.view.user.id), emoji=emoji),]
+                    for alt_id in self.view.user_settings.alts:
+                        alt = self.view.bot.get_user(alt_id)
+                        label = str(alt_id)
+                        if alt is not None:
+                            alt_name = alt.global_name if alt.global_name is not None else alt.name
+                        else:
+                            alt_name = label
+                        emoji = emojis.BP if alt_id == self.view.active_alt_id else None
+                        options.append(discord.SelectOption(label=label, value=str(alt_id), emoji=emoji))
+                    child.options = options
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class SwitchSettingsSelect(discord.ui.Select):
+    """Select to switch between settings embeds"""
+    def __init__(self, view: discord.ui.DesignerView, commands_settings: Dict[str, Callable]):
+        self.commands_settings = commands_settings
+        options = []
+        for label in commands_settings.keys():
+            options.append(discord.SelectOption(label=label, value=label, emoji=None))
+        super().__init__(placeholder='➜ Switch to other settings', min_values=1, max_values=1, options=options,
+                         custom_id='switch_settings')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        await interaction.response.edit_message()
+        await self.commands_settings[select_value](self.view.bot, self.view.ctx, switch_view = self.view)
+
+
+class ManageUserSettingsSelect(discord.ui.Select):
+    """Select to change user settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        reactions_emoji = emojis.ENABLED if view.user_settings.reactions_enabled else emojis.DISABLED
+        auto_flex_emoji = emojis.ENABLED if view.user_settings.auto_flex_enabled else emojis.DISABLED
+        auto_flex_ping_emoji = emojis.ENABLED if view.user_settings.auto_flex_ping_enabled else emojis.DISABLED
+        tracking_emoji = emojis.ENABLED if view.user_settings.tracking_enabled else emojis.DISABLED
+        if not settings.LITE_MODE:
+            options.append(discord.SelectOption(label=f'Reactions', emoji=reactions_emoji,
+                                                value='toggle_reactions'))
+        options.append(discord.SelectOption(label=f'Auto flex alerts', emoji=auto_flex_emoji,
+                                            value='toggle_auto_flex'))
+        options.append(discord.SelectOption(label=f'Auto flex ping', emoji=auto_flex_ping_emoji,
+                                            value='toggle_auto_flex_ping'))
+        if view.user_settings.partner_id is None:
+            options.append(discord.SelectOption(label=f'Change partner pocket watch reduction', emoji=None,
+                                                value='set_partner_pocket_watch_reduction'))
+        options.append(discord.SelectOption(label=f'Command tracking', emoji=tracking_emoji,
+                                            value='toggle_tracking'))
+        options.append(discord.SelectOption(label=f'Change last time travel time',
+                                            value='set_last_tt', emoji=None))
+        super().__init__(placeholder='Change settings', min_values=1, max_values=1, options=options,
+                         custom_id='manage_user_settings')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        if select_value == 'toggle_reactions':
+            await self.view.user_settings.update(reactions_enabled=not self.view.user_settings.reactions_enabled)
+        elif select_value == 'toggle_auto_flex':
+            await self.view.user_settings.update(auto_flex_enabled=not self.view.user_settings.auto_flex_enabled)
+        elif select_value == 'toggle_auto_flex_ping':
+            await self.view.user_settings.update(auto_flex_ping_enabled=not self.view.user_settings.auto_flex_ping_enabled)
+        elif select_value == 'toggle_tracking':
+            await self.view.user_settings.update(tracking_enabled=not self.view.user_settings.tracking_enabled)
+        elif select_value == 'set_partner_pocket_watch_reduction':
+            modal = modals.SetPartnerPocketWatchReductionModal(self.view)
+            await interaction.response.send_modal(modal)
+            return
+        elif select_value == 'set_last_tt':
+            modal = modals.SetLastTTModal(self.view)
+            await interaction.response.send_modal(modal)
+            return
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, ManageUserSettingsSelect):
+                    options = []
+                    reactions_emoji = emojis.ENABLED if self.view.user_settings.reactions_enabled else emojis.DISABLED
+                    auto_flex_emoji = emojis.ENABLED if self.view.user_settings.auto_flex_enabled else emojis.DISABLED
+                    auto_flex_ping_emoji = emojis.ENABLED if self.view.user_settings.auto_flex_ping_enabled else emojis.DISABLED
+                    tracking_emoji = emojis.ENABLED if self.view.user_settings.tracking_enabled else emojis.DISABLED
+                    if not settings.LITE_MODE:
+                        options.append(discord.SelectOption(label=f'Reactions', emoji=reactions_emoji,
+                                                            value='toggle_reactions'))
+                    options.append(discord.SelectOption(label=f'Auto flex alerts', emoji=auto_flex_emoji,
+                                                        value='toggle_auto_flex'))
+                    options.append(discord.SelectOption(label=f'Auto flex ping', emoji=auto_flex_ping_emoji,
+                                                        value='toggle_auto_flex_ping'))
+                    if self.view.user_settings.partner_id is None:
+                        options.append(discord.SelectOption(label=f'Change partner pocket watch reduction', emoji=None,
+                                                            value='set_partner_pocket_watch_reduction'))
+                    options.append(discord.SelectOption(label=f'Command tracking', emoji=tracking_emoji,
+                                                        value='toggle_tracking'))
+                    options.append(discord.SelectOption(label=f'Change last time travel time',
+                                                        value='set_last_tt', emoji=None))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ManageReminderBehaviourSelect(discord.ui.Select):
+    """Select to change reminder behaviour settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        dnd_emoji = emojis.ENABLED if view.user_settings.dnd_mode_enabled else emojis.DISABLED
+        mentions_emoji = emojis.ENABLED if view.user_settings.slash_mentions_enabled else emojis.DISABLED
+        a20_cd_emoji = emojis.ENABLED if view.user_settings.area_20_cooldowns_enabled else emojis.DISABLED
+        hunt_combine_emoji = emojis.ENABLED if view.user_settings.hunt_reminders_combined else emojis.DISABLED
+        #christmas_area_emoji = emojis.ENABLED if view.user_settings.christmas_area_enabled else emojis.DISABLED
+        options.append(discord.SelectOption(label='DND mode', emoji=dnd_emoji,
+                                            value='toggle_dnd'))
+        options.append(discord.SelectOption(label='Slash command reminders', emoji=mentions_emoji,
+                                            value='toggle_mentions'))
+        options.append(discord.SelectOption(label='Read cooldowns in area 20', emoji=a20_cd_emoji,
+                                            value='toggle_a20_cd'))
+        options.append(discord.SelectOption(label='Combine hunt reminders', emoji=hunt_combine_emoji,
+                                            value='toggle_hunt_reminders_combined'))
+        options.append(discord.SelectOption(label='Add this channel as reminder channel', emoji=emojis.ADD,
+                                            value='set_channel'))
+        options.append(discord.SelectOption(label='Remove reminder channel', emoji=emojis.REMOVE,
+                                            value='reset_channel'))
+        #options.append(discord.SelectOption(label=f'{christmas_area_action} christmas area mode',
+        #                                    value='toggle_christmas_area'))
+        super().__init__(placeholder='Manage reminder behaviour', min_values=1, max_values=1, options=options,
+                         custom_id='manage_reminder_behaviour')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        user_global_name = interaction.user.global_name if interaction.user.global_name is not None else interaction.user.name
+        if select_value == 'toggle_dnd':
+            await self.view.user_settings.update(dnd_mode_enabled=not self.view.user_settings.dnd_mode_enabled)
+        elif select_value == 'toggle_mentions':
+            await self.view.user_settings.update(slash_mentions_enabled=not self.view.user_settings.slash_mentions_enabled)
+        elif select_value == 'toggle_a20_cd':
+            await self.view.user_settings.update(area_20_cooldowns_enabled=not self.view.user_settings.area_20_cooldowns_enabled)
+        elif select_value == 'toggle_hunt_reminders_combined':
+            if not self.view.user_settings.hunt_reminders_combined and not self.view.user_settings.alert_hunt_partner.enabled:
+                await interaction.response.send_message(
+                    'To use this setting, you need to enable the `hunt partner` reminder first.',
+                    ephemeral=True
+                )
+                return
+            await self.view.user_settings.update(hunt_reminders_combined=not self.view.user_settings.hunt_reminders_combined)
+        elif select_value == 'set_channel':
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.blurple, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, do you want to set `{interaction.channel.name}` as the reminder '
+                f'channel?\n'
+                f'If a reminder channel is set, all reminders will be sent to that channel\n',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                await self.view.user_settings.update(reminder_channel_id=interaction.channel.id)
+                await confirm_interaction.edit_original_response(content='Channel updated.', view=None)
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        elif select_value == 'reset_channel':
+            if self.view.user_settings.reminder_channel_id is None:
+                await interaction.response.send_message(
+                    f'You don\'t have a reminder channel set.',
+                    ephemeral=True
+                )
+                return
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.red, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, do you want to reset your reminder channel?\n\n'
+                f'If you do this, reminders will be sent to where you create them.',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                await self.view.user_settings.update(reminder_channel_id=None)
+                await confirm_interaction.edit_original_response(content='Channel reset.', view=None)
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        for action_row in self.view.children.copy():
+            for child in action_row.children:
+                if isinstance(child, ManageReminderBehaviourSelect):
+                    options = []
+                    dnd_emoji = emojis.ENABLED if self.view.user_settings.dnd_mode_enabled else emojis.DISABLED
+                    mentions_emoji = emojis.ENABLED if self.view.user_settings.slash_mentions_enabled else emojis.DISABLED
+                    a20_cd_emoji = emojis.ENABLED if self.view.user_settings.area_20_cooldowns_enabled else emojis.DISABLED
+                    hunt_combine_emoji = emojis.ENABLED if self.view.user_settings.hunt_reminders_combined else emojis.DISABLED
+                    options.append(discord.SelectOption(label='DND mode', emoji=dnd_emoji,
+                                                        value='toggle_dnd'))
+                    options.append(discord.SelectOption(label='Slash command reminders', emoji=mentions_emoji,
+                                                        value='toggle_mentions'))
+                    options.append(discord.SelectOption(label='Read cooldowns in area 20', emoji=a20_cd_emoji,
+                                                        value='toggle_a20_cd'))
+                    options.append(discord.SelectOption(label='Combine hunt reminders', emoji=hunt_combine_emoji,
+                                                        value='toggle_hunt_reminders_combined'))
+                    options.append(discord.SelectOption(label='Add this channel as reminder channel', emoji=emojis.ADD,
+                                                        value='set_channel'))
+                    options.append(discord.SelectOption(label='Remove reminder channel', emoji=emojis.REMOVE,
+                                                        value='reset_channel'))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class RemoveAltSelect(discord.ui.Select):
+    """Select to change alt settings"""
+    def __init__(self, view: discord.ui.DesignerView, disabled: Optional[bool] = False):
+        options = []
+        for alt_id in view.user_settings.alts:
+            alt = view.bot.get_user(alt_id)
+            if alt is None:
+                label = str(alt_id)
+            else:
+                label = alt.global_name if alt.global_name is not None else alt.name
+            options.append(discord.SelectOption(label=label, value=str(alt_id), emoji=emojis.REMOVE))
+        if not options:
+            options.append(discord.SelectOption(label='None', value='None'))
+            disabled = True
+        super().__init__(placeholder='Remove alts', min_values=1, max_values=1, disabled=disabled,
+                         options=options, custom_id='remove_alts')
+
+    async def callback(self, interaction: discord.Interaction):
+        alt_id = int(self.values[0])
+        user_global_name = interaction.user.global_name if interaction.user.global_name is not None else interaction.user.name
+        confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.red, discord.ButtonStyle.grey])
+        confirm_interaction = await interaction.response.send_message(
+            f'**{user_global_name}**, do you want to remove <@{alt_id}> as your alt?',
+            view=confirm_view,
+            ephemeral=True
+        )
+        confirm_view.interaction_message = confirm_interaction
+        await confirm_view.wait()
+        if confirm_view.value == 'confirm':
+            await self.view.user_settings.remove_alt(alt_id)
+            await confirm_interaction.edit_original_response(content='Alt removed.', view=None)
+        else:
+            await confirm_interaction.edit_original_response(content='Aborted', view=None)
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, RemoveAltSelect):
+                    options = []
+                    for alt_id in self.view.user_settings.alts:
+                        alt = self.view.bot.get_user(alt_id)
+                        if alt is None:
+                            label = str(alt_id)
+                        else:
+                            label = alt.global_name if alt.global_name is not None else alt.name
+                        options.append(discord.SelectOption(label=label, value=str(alt_id), emoji=emojis.REMOVE))
+                    if options:
+                        child.options = options
+                    else:
+                        child.disabled = True
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ManagePartnerSettingsSelect(discord.ui.Select):
+    """Select to change partner settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        if view.user_settings.partner_id is None:
+            options.append(discord.SelectOption(label='Change partner pocket watch reduction', emoji=None,
+                                                value='set_partner_pocket_watch_reduction'))
+            emoji = emojis.ENABLED if view.user_settings.partner_chocolate_box_unlocked else emojis.DISABLED
+            options.append(discord.SelectOption(label='Partner has chocolate box artifact', emoji=emoji,
+                                                value='toggle_partner_chocolate_box_unlocked'))
+        options.append(discord.SelectOption(label='Add this channel as partner channel',
+                                            value='set_channel', emoji=emojis.ADD))
+        options.append(discord.SelectOption(label='Remove partner channel',
+                                            value='reset_channel', emoji=emojis.REMOVE))
+        options.append(discord.SelectOption(label='Remove partner',
+                                            value='reset_partner', emoji=emojis.REMOVE))
+        super().__init__(placeholder='Change settings', min_values=1, max_values=1, options=options,
+                         custom_id='manage_partner_settings')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        user_global_name = interaction.user.global_name if interaction.user.global_name is not None else interaction.user.name
+        if select_value == 'set_channel':
+            if self.view.user_settings.partner_id is None:
+                await interaction.response.send_message(
+                    f'You need to set a partner first.\n'
+                    f'To set a partner use the menu `Change partner`.',
+                    ephemeral=True
+                )
+                return
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.blurple, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, do you want to set `{interaction.channel.name}` as the partner alert '
+                f'channel?\n'
+                f'The partner alert channel is where you will be sent lootbox alerts from your '
+                f'partner. You can toggle partner alerts in `Reminder settings`.',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                await self.view.user_settings.update(partner_channel_id=interaction.channel.id)
+                await confirm_interaction.edit_original_response(
+                    content=(
+                        f'Channel updated.\n'
+                        f'To receive partner alerts, make sure the partner alert is enabled in `Reminder settings`.'
+                    ),
+                    view=None
+                )
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        elif select_value == 'set_partner_pocket_watch_reduction':
+            modal = modals.SetPartnerPocketWatchReductionModal(self.view)
+            await interaction.response.send_modal(modal)
+            return
+        elif select_value == 'toggle_partner_chocolate_box_unlocked':
+            await self.view.user_settings.update(
+                partner_chocolate_box_unlocked=not self.view.user_settings.partner_chocolate_box_unlocked
+            )
+        elif select_value == 'reset_channel':
+            if self.view.user_settings.partner_channel_id is None:
+                await interaction.response.send_message(
+                    f'You don\'t have a partner alert channel set.',
+                    ephemeral=True
+                )
+                return
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.red, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, do you want to reset your partner alert channel?\n\n'
+                f'If you do this, partner alerts will not work even if turned on.',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                await self.view.user_settings.update(partner_channel_id=None)
+                await confirm_interaction.edit_original_response(content='Channel reset.', view=None)
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        elif select_value == 'reset_partner':
+            if self.view.user_settings.partner_id is None:
+                await interaction.response.send_message(
+                    f'You don\'t have a partner set.',
+                    ephemeral=True
+                )
+                return
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.red, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, do you want to reset your partner?\n\n'
+                f'This will also reset your partner\'s partner (which is you, heh) and set the '
+                f'partner donor tiers back to `Non-donator`.',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                await self.view.user_settings.update(partner_id=None, partner_donor_tier=0,
+                                                     partner_pocket_watch_multiplier=1, partner_chocolate_box_unlocked=False,
+                                                     partner_name=None)
+                await self.view.partner_settings.update(partner_id=None, partner_donor_tier=0,
+                                                        partner_pocket_watch_multiplier=1, partner_chocolate_box_unlocked=False,
+                                                        partner_name=None)
+                self.view.partner_settings = None
+                await confirm_interaction.edit_original_response(content='Partner reset.', view=None)
+                for action_row in self.view.children.copy():
+                    for child in action_row.children.copy():
+                        if isinstance(child, SetDonorTierSelect):
+                            child.disabled = False
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, ManagePartnerSettingsSelect):
+                    options = []
+                    if self.view.user_settings.partner_id is None:
+                        options.append(discord.SelectOption(label='Change partner pocket watch reduction', emoji=None,
+                                                            value='set_partner_pocket_watch_reduction'))
+                        emoji = emojis.ENABLED if self.view.user_settings.partner_chocolate_box_unlocked else emojis.DISABLED
+                        options.append(discord.SelectOption(label='Partner has chocolate box artifact', emoji=emoji,
+                                                            value='toggle_partner_chocolate_box_unlocked'))
+                    options.append(discord.SelectOption(label='Add this channel as partner channel',
+                                                        value='set_channel', emoji=emojis.ADD))
+                    options.append(discord.SelectOption(label='Remove partner channel',
+                                                        value='reset_channel', emoji=emojis.REMOVE))
+                    options.append(discord.SelectOption(label='Remove partner',
+                                                        value='reset_partner', emoji=emojis.REMOVE))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings, self.view.partner_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class SetPartnerAlertThreshold(discord.ui.Select):
+    """Select to change the partner alert threshold"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        for index, (name, emoji) in enumerate(strings.LOOTBOXES.items()):
+            options.append(discord.SelectOption(label=name,
+                                                value=str(index), emoji=emoji))
+        super().__init__(placeholder='Change partner alert lootbox threshold', min_values=1, max_values=1, options=options,
+                         custom_id='set_alert_threshold')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = int(self.values[0])
+        await self.view.user_settings.update(partner_alert_threshold=select_value)
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings, self.view.partner_settings)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class SetDonorTierSelect(discord.ui.Select):
+    """Select to set a donor tier"""
+    def __init__(self, view: discord.ui.DesignerView, placeholder: str, donor_type: Optional[str] = 'user',
+                 disabled: Optional[bool] = False):
+        self.donor_type = donor_type
+        options = []
+        for index, donor_tier in enumerate(strings.DONOR_TIERS):
+            options.append(discord.SelectOption(label=donor_tier, value=str(index),
+                                                emoji=strings.DONOR_TIERS_EMOJIS[donor_tier]))
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options, disabled=disabled,
+                         custom_id=f'set_{donor_type}_donor_tier')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        if self.donor_type == 'user':
+            await self.view.user_settings.update(user_donor_tier=int(select_value))
+        elif self.donor_type == 'partner':
+            await self.view.user_settings.update(partner_donor_tier=int(select_value))
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class AddAltSelect(discord.ui.Select):
+    """Select to add a new alt"""
+    def __init__(self, view: discord.ui.DesignerView, disabled: Optional[bool] = False):
+        super().__init__(select_type=discord.ComponentType.user_select, min_values=1, max_values=1, disabled=disabled,
+                         custom_id='add_alt', placeholder='Add alts')
+
+    async def callback(self, interaction: discord.Interaction):
+
+        async def update_message() -> None:
+            embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings)
+            if interaction.response.is_done():
+                await interaction.message.edit(embed=embed, view=self.view)
+            else:
+                await interaction.response.edit_message(embed=embed, view=self.view)
+
+            await asyncio.sleep(0.1)
+            disabled_add = True if len(self.view.user_settings.alts) >= 24 else False
+            for action_row in self.view.children.copy():
+                for child in action_row.children.copy():
+                    if isinstance(child, AddAltSelect):
+                        child.disabled = disabled_add
+                    if isinstance(child, RemoveAltSelect):
+                        options = []
+                        for alt_id in self.view.user_settings.alts:
+                            alt = self.view.bot.get_user(alt_id)
+                            if alt is None:
+                                label = str(alt_id)
+                            else:
+                                label = alt.global_name if alt.global_name is not None else alt.name
+                            options.append(discord.SelectOption(label=label, value=str(alt_id), emoji=emojis.REMOVE))
+                        if options:
+                            child.options = options
+                            child.disabled = False
+                        break
+            await interaction.message.edit(view=self.view)
+
+        new_alt = self.values[0]
+        alt_global_name = new_alt.global_name if new_alt.global_name is not None else new_alt.name
+        if new_alt == interaction.user:
+            await interaction.response.send_message(
+                'You want to add **yourself** as an alt? Are you **that** lonely?',
+                ephemeral=True
+            )
+            await update_message()
+            return
+        if new_alt.id in self.view.user_settings.alts:
+            await interaction.response.send_message(f'**{alt_global_name}** is already set as an alt.', ephemeral=True)
+            await update_message()
+            return
+        if new_alt.bot:
+            await interaction.response.send_message(
+                'Sorry, bots are not allowed to be alts, they are too smol.',
+                ephemeral=True
+            )
+            await update_message()
+            return
+        if len(self.view.user_settings.alts) >= 24:
+            await interaction.response.send_message(
+                'You already have 24 alts and no space left. You need to remove one first.',
+                ephemeral=True
+            )
+            await update_message()
+            return
+        try:
+            new_alt_settings = await users.get_user(new_alt.id)
+        except exceptions.FirstTimeUserError:
+            await interaction.response.send_message(
+                f'**{alt_global_name}** is not registered with Epic Navi yet. They need to do '
+                f'{await functions.get_navi_slash_command(self.view.bot, "on")} first.',
+                ephemeral=True
+            )
+            await update_message()
+            return
+        if len(new_alt_settings.alts) >= 24:
+            await interaction.response.send_message(
+                f'**{alt_global_name}** already has 24 alts and no space left. They need to remove one first.',
+                ephemeral=True
+            )
+            await update_message()
+            return
+        view = views.ConfirmUserView(new_alt, 'Sure', 'Ugh, no')
+        user_global_name = interaction.user.global_name if interaction.user.global_name is not None else interaction.user.name
+        interaction = await interaction.response.send_message(
+            f'{new_alt.mention}, **{user_global_name}** wants to set you as their alt. '
+            f'Do you want to allow that?\n\n'
+            f'_Alts have the following benefits:_\n'
+            f'{emojis.BP} _Alts are allowed to ping each other in reminders_\n'
+            f'{emojis.BP} _You can quickly switch to alts in '
+            f'{await functions.get_navi_slash_command(self.view.bot, "ready")}, '
+            f'{await functions.get_navi_slash_command(self.view.bot, "list")}'
+            f'and {await functions.get_navi_slash_command(self.view.bot, "stats")}._',
+            view=view
+        )
+        view.interaction = interaction
+        await view.wait()
+        if view.value is None:
+            await interaction.edit(content=f'**{user_global_name}**, the user didn\'t answer in time.', view=None)
+        elif view.value == 'confirm':
+            await self.view.user_settings.add_alt(new_alt.id)
+            await interaction.edit(
+                content=f'**{user_global_name}** and **{alt_global_name}** are now alts of each other.',
+                view=None
+            )
+        else:
+            await interaction.edit(
+                content=(
+                    f'**{alt_global_name}** doesn\'t want to be an alt. Oh no.\n'
+                    f'Guess they don\'t like you. Oh well. Happens.'
+                ),
+                view=None
+            )
+        await update_message()
+
+
+class AddPartnerSelect(discord.ui.Select):
+    """Select to add a new partner"""
+    def __init__(self, view: discord.ui.DesignerView, placeholder: str,
+                 disabled: Optional[bool] = False):
+        super().__init__(select_type=discord.ComponentType.user_select, min_values=1, max_values=1, disabled=disabled,
+                         custom_id='choose_user', placeholder=placeholder)
+
+    async def callback(self, interaction: discord.Interaction):
+
+        async def update_message() -> None:
+            embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings,
+                                               self.view.partner_settings)
+            if interaction.response.is_done():
+                await interaction.message.edit(embed=embed, view=self.view)
+            else:
+                await interaction.response.edit_message(embed=embed, view=self.view)
+            await asyncio.sleep(0.1)
+            await interaction.message.edit(embed=embed, view=self.view)
+
+        new_partner = self.values[0]
+        partner_global_name = new_partner.global_name if new_partner.global_name is not None else new_partner.name
+        user_global_name = interaction.user.global_name if interaction.user.global_name is not None else interaction.user.name
+        if new_partner == interaction.user:
+            await interaction.response.send_message('Marrying yourself? Now that\'s just sad.', ephemeral=True)
+            await update_message()
+            return
+        try:
+            new_partner_settings: users.User = await users.get_user(new_partner.id)
+        except exceptions.FirstTimeUserError:
+            await interaction.response.send_message(
+                f'**{partner_global_name}** is not registered with Epic Navi yet. They need to do '
+                f'{await functions.get_navi_slash_command(self.view.bot, "on")} first.',
+                ephemeral=True
+            )
+            await update_message()
+            return
+        if self.view.user_settings.partner_id is not None:
+            view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.red, discord.ButtonStyle.grey])
+            replace_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, you already have a partner set.\n'
+                f'Setting a new partner will remove your old partner. Do you want to continue?',
+                view=view,
+                ephemeral=True
+            )
+            view.interaction_message = replace_interaction
+            await view.wait()
+            if view.value is None:
+                await replace_interaction.edit(
+                    content=f'**{user_global_name}**, you didn\'t answer in time.',
+                    view=None
+                )
+                await update_message()
+                return
+            elif view.value == 'confirm':
+                await replace_interaction.edit(view=None)
+            else:
+                await replace_interaction.edit(content='Aborted.', view=None)
+                await update_message()
+                return
+        view = views.ConfirmUserView(new_partner, 'I do!', 'Forever alone')
+        partner_answer = (
+            f'{new_partner.mention}, **{user_global_name}** wants to set you as their partner.\n'
+            f'Do you want to grind together until... idk, drama?'
+        )
+        if interaction.response.is_done():
+            partner_interaction = await interaction.followup.send(partner_answer, view=view)
+        else:
+            partner_interaction = await interaction.response.send_message(partner_answer, view=view)
+        view.interaction = partner_interaction
+        await view.wait()
+        if view.value is None:
+            await partner_interaction.edit(
+                content=f'**{user_global_name}**, your lazy partner didn\'t answer in time.',
+                view=None
+            )
+            await update_message()
+            return
+        elif view.value == 'confirm':
+            if self.view.user_settings.partner_id is not None:
+                try:
+                    old_partner_settings = await users.get_user(self.view.user_settings.partner_id)
+                    await old_partner_settings.update(partner_id=None)
+                except exceptions.NoDataFoundError:
+                    pass
+            await self.view.user_settings.update(partner_id=new_partner.id, partner_donor_tier=new_partner_settings.user_donor_tier,
+                                                 partner_pocket_watch_multiplier=new_partner_settings.user_pocket_watch_multiplier,
+                                                 partner_chocolate_box_unlocked=new_partner_settings.chocolate_box_unlocked)
+            await new_partner_settings.update(
+                partner_id=interaction.user.id, partner_donor_tier=self.view.user_settings.user_donor_tier,
+                partner_pocket_watch_multiplier=self.view.user_settings.user_pocket_watch_multiplier,
+                partner_chocolate_box_unlocked=self.view.user_settings.chocolate_box_unlocked
+            )
+            if self.view.user_settings.partner_id == new_partner.id and new_partner_settings.partner_id == interaction.user.id:
+                answer = (
+                    f'{emojis.BP} **{user_global_name}**, {partner_global_name} is now set as your partner!\n'
+                    f'{emojis.BP} **{partner_global_name}**, {user_global_name} is now set as your partner!\n'
+                    f'{emojis.BP} **{user_global_name}**, {user_global_name} is now set as your partner\'s partner!\n'
+                    f'{emojis.BP} **{partner_global_name}**, ... wait what?\n\n'
+                    f'Anyway, you may now kiss the brides.'
+                )
+                for action_row in self.view.children.copy():
+                    for child in action_row.children.copy():
+                        if isinstance(child, SetDonorTierSelect):
+                            child.disabled = True
+                await partner_interaction.edit(view=None)
+                await interaction.followup.send(answer)
+            else:
+                await interaction.followup.send(strings.MSG_ERROR)
+                await update_message()
+                return
+        else:
+            await partner_interaction.edit(
+                content=(
+                    f'**{partner_global_name}** prefers to be forever alone.\n'
+                    f'Stood up at the altar, that\'s gotta hurt, rip.'
+                ),
+                view=None
+            )
+            return
+        self.view.partner_settings = new_partner_settings
+        await update_message()
+
+
+class ReminderMessageSelect(discord.ui.Select):
+    """Select to select reminder messages by activity"""
+    def __init__(self, view: discord.ui.DesignerView, activities: list[str], placeholder: str, custom_id: str):
+        options = []
+        options.append(discord.SelectOption(label='All', value='all', emoji=None))
+        for activity in activities:
+            options.append(discord.SelectOption(label=activity.replace('-',' ').capitalize(), value=activity, emoji=None))
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options,
+                         custom_id=custom_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        self.view.activity = select_value
+        change_disabled = True if select_value == 'all' else False
+        for action_row in self.view.children:
+            for child in action_row.children:
+                if child.custom_id == 'set_message':
+                    child.disabled = change_disabled
+        embeds = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings, select_value)
+        await interaction.response.edit_message(embeds=embeds, view=self.view)
+
+
+class SetReminderMessageButton(discord.ui.Button):
+    """Button to edit reminder messages"""
+    def __init__(self, style: discord.ButtonStyle, custom_id: str, label: str, disabled: Optional[bool] = False,
+                 emoji: Optional[discord.PartialEmoji] = None):
+        super().__init__(style=style, custom_id=custom_id, label=label, emoji=emoji,
+                         disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        user_global_name = interaction.user.global_name if interaction.user.global_name is not None else interaction.user.name
+        def check(m: discord.Message) -> bool:
+            return m.author == interaction.user and m.channel == interaction.channel
+
+        if self.custom_id == 'reset_message':
+            if self.view.activity != 'all':
+                new_message = strings.DEFAULT_MESSAGES[self.view.activity]
+            else:
+                confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.red, discord.ButtonStyle.grey])
+                confirm_interaction = await interaction.response.send_message(
+                    f'**{user_global_name}**, this will reset **all** messages to the default one. '
+                    f'Are you sure?',
+                    view=confirm_view,
+                    ephemeral=True
+                )
+                confirm_view.interaction_message = confirm_interaction
+                await confirm_view.wait()
+                if confirm_view.value == 'confirm':
+                    updated_settings = {}
+                    for activity in strings.ACTIVITIES:
+                        activity_column = strings.ACTIVITIES_COLUMNS[activity]
+                        updated_settings[f'{activity_column}_message'] = strings.DEFAULT_MESSAGES[activity]
+                    await self.view.user_settings.update(**updated_settings)
+                    await interaction.edit_original_response(
+                        content=(
+                            f'Changed all messages back to their default message.\n\n'
+                            f'Note that running reminders do not update automatically.'
+                        ),
+                        view=None
+                    )
+                    embeds = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings, self.view.activity)
+                    await interaction.message.edit(embeds=embeds, view=self.view)
+                    return
+                else:
+                    await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                    return
+        else:
+            await interaction.response.send_message(
+                f'**{user_global_name}**, please send the new reminder message to this channel (or `abort` to abort):',
+            )
+            try:
+                answer = await self.view.bot.wait_for('message', check=check, timeout=60)
+            except asyncio.TimeoutError:
+                await interaction.edit_original_response(content=f'**{user_global_name}**, you didn\'t answer in time.')
+                return
+            for found_id in re.findall(r'<@!?&?(\d{16,20})>', answer.content.lower()):
+                if int(found_id) != interaction.user.id and int(found_id) not in self.view.user_settings.alts:
+                    await interaction.delete_original_response(delay=5)
+                    followup_message = await interaction.followup.send(
+                        content=(
+                            f'Aborted. You are only allowed to ping yourself and your alts set in '
+                            f'{await functions.get_navi_slash_command(self.view.bot, "settings alts")} in reminders.'
+                        ),
+                    )
+                    await followup_message.delete(delay=5)
+                    return
+            new_message = answer.content
+            if new_message.lower() in ('abort','cancel','stop'):
+                await interaction.delete_original_response(delay=3)
+                followup_message = await interaction.followup.send('Aborted.')
+                await followup_message.delete(delay=3)
+                return
+            if len(new_message) > 1024:
+                await interaction.delete_original_response(delay=5)
+                followup_message = await interaction.followup.send(
+                    'This is a command to set a new message, not to write a novel :thinking:',
+                )
+                await followup_message.delete(delay=5)
+                return
+            for placeholder in re.finditer(r'\{(.+?)\}', new_message):
+                placeholder_str = placeholder.group(1)
+                if placeholder_str not in strings.DEFAULT_MESSAGES[self.view.activity]:
+                    allowed_placeholders = ''
+                    for placeholder in re.finditer(r'\{(.+?)\}', strings.DEFAULT_MESSAGES[self.view.activity]):
+                        allowed_placeholders = (
+                            f'{allowed_placeholders}\n'
+                            f'{emojis.BP} {{{placeholder.group(1)}}}'
+                        )
+                    if allowed_placeholders == '':
+                        allowed_placeholders = f'There are no placeholders available for this message.'
+                    else:
+                        allowed_placeholders = (
+                            f'Available placeholders for this message:\n'
+                            f'{allowed_placeholders.strip()}'
+                        )
+                    await interaction.delete_original_response(delay=3)
+                    followup_message = await interaction.followup.send(
+                        f'Invalid placeholder found.\n\n'
+                        f'{allowed_placeholders}',
+                        ephemeral=True
+                    )
+                    await followup_message.delete(delay=3)
+                    return
+            await interaction.delete_original_response(delay=3)
+            followup_message = await interaction.followup.send(
+                f'Message updated!\n\n'
+                f'Note that running reminders do not update automatically.'
+            )
+            await followup_message.delete(delay=3)
+        updated_settings = {}
+        activity_column = strings.ACTIVITIES_COLUMNS[self.view.activity]
+        updated_settings[f'{activity_column}_message'] = new_message
+        await self.view.user_settings.update(**updated_settings)
+        embeds = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings, self.view.activity)
+        if interaction.response.is_done():
+            await interaction.message.edit(embeds=embeds, view=self.view)
+        else:
+            await interaction.response.edit_message(embeds=embeds, view=self.view)
+
+
+class ToggleTimestampsButton(discord.ui.Button):
+    """Button to toggle reminder list between timestamps and timestrings"""
+    def __init__(self, label: str):
+        super().__init__(style=discord.ButtonStyle.grey, custom_id='toggle_timestamps', label=label,
+                         emoji=None)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.view.show_timestamps = not self.view.show_timestamps
+        if self.view.show_timestamps:
+            self.label = 'Show time left'
+        else:
+            self.label = 'Show end time'
+        embed = await self.view.embed_function(self.view.bot, self.view.user, self.view.show_timestamps)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class DeleteCustomReminderSelect(discord.ui.Select):
+    """Select to delete custom reminders"""
+    def __init__(self, view: discord.ui.DesignerView, custom_reminders: list[reminders.Reminder]):
+        self.custom_reminders = custom_reminders
+
+        options = []
+        for reminder in custom_reminders:
+            label = f'{reminder.custom_id} - {reminder.message[:92]}'
+            options.append(discord.SelectOption(label=label, value=str(reminder.custom_id), emoji=None))
+        super().__init__(placeholder='Delete custom reminders', min_values=1, max_values=1, options=options,
+                         custom_id=f'delete_reminders')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        for reminder in self.custom_reminders.copy():
+            if reminder.custom_id == int(select_value):
+                await reminder.delete()
+                self.custom_reminders.remove(reminder)
+                for custom_reminder in self.view.custom_reminders:
+                    if custom_reminder.custom_id == reminder.custom_id:
+                        self.view.custom_reminder.remove(custom_reminder)
+                        break
+        embed = await self.view.embed_function(self.view.bot, self.view.user, self.view.show_timestamps)
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, DeleteCustomReminderSelect):
+                    if not self.custom_reminders:
+                        self.view = self.view.remove_item(action_row)
+                    else:
+                        options = []
+                        for reminder in self.custom_reminders:
+                            label = f'{reminder.custom_id} - {reminder.message[:92]}'
+                            options.append(discord.SelectOption(label=label, value=str(reminder.custom_id), emoji=None))
+                        child.options = options
+                    break
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ToggleTrackingButton(discord.ui.Button):
+    """Button to toggle the auto-ready feature"""
+    def __init__(self, style: Optional[discord.ButtonStyle], custom_id: str, label: str,
+                 disabled: bool = False, emoji: Optional[discord.PartialEmoji] = None):
+        super().__init__(style=style, custom_id=custom_id, label=label, emoji=emoji,
+                         disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        enabled = True if self.custom_id == 'track' else False
+        await self.view.user_settings.update(tracking_enabled=enabled)
+        self.view.value = self.custom_id
+        await self.view.user_settings.refresh()
+        if self.view.user_settings.tracking_enabled:
+            self.style = discord.ButtonStyle.grey
+            self.label = 'Stop tracking me!'
+            self.custom_id = 'untrack'
+        else:
+            self.style = discord.ButtonStyle.green
+            self.label = 'Track me!'
+            self.custom_id = 'track'
+        if not interaction.response.is_done():
+            await interaction.response.edit_message(view=self.view)
+        else:
+            await self.view.message.edit(view=self.view)
+
+
+class ManageHelperSettingsSelect(discord.ui.Select):
+    """Select to change helper settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        tr_helper_mode = 'text' if view.user_settings.training_helper_button_mode else 'buttons'
+        pet_helper_mode = 'commands' if view.user_settings.pet_helper_icon_mode else 'icons'
+        ruby_counter_mode = 'text' if view.user_settings.ruby_counter_button_mode else 'buttons'
+        ping_mode_setting = 'before' if view.user_settings.ping_after_message else 'after'
+        options.append(discord.SelectOption(label=f'Change pet catch helper to {pet_helper_mode}',
+                                            value='toggle_pet_helper_mode'))
+        options.append(discord.SelectOption(label=f'Change ruby counter to {ruby_counter_mode}',
+                                            value='toggle_ruby_counter_mode'))
+        options.append(discord.SelectOption(label=f'Change training helper to {tr_helper_mode}',
+                                            value='toggle_tr_helper_mode'))
+        options.append(discord.SelectOption(label=f'Ping {ping_mode_setting} helper message',
+                                            value='toggle_ping_mode'))
+        super().__init__(placeholder='Change settings', min_values=1, max_values=1, options=options,
+                         custom_id='manage_user_settings')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        if select_value == 'toggle_tr_helper_mode':
+            await self.view.user_settings.update(
+                training_helper_button_mode=not self.view.user_settings.training_helper_button_mode
+            )
+        elif select_value == 'toggle_pet_helper_mode':
+            await self.view.user_settings.update(
+                pet_helper_icon_mode=not self.view.user_settings.pet_helper_icon_mode
+            )
+        elif select_value == 'toggle_ruby_counter_mode':
+            await self.view.user_settings.update(
+                ruby_counter_button_mode=not self.view.user_settings.ruby_counter_button_mode
+            )
+        elif select_value == 'toggle_ping_mode':
+            await self.view.user_settings.update(
+                ping_after_message=not self.view.user_settings.ping_after_message
+            )
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, ManageHelperSettingsSelect):
+                    options = []
+                    tr_helper_mode = 'text' if self.view.user_settings.training_helper_button_mode else 'buttons'
+                    pet_helper_mode = 'commands' if self.view.user_settings.pet_helper_icon_mode else 'icons'
+                    ruby_counter_mode = 'text' if self.view.user_settings.ruby_counter_button_mode else 'buttons'
+                    ping_mode_setting = 'before' if self.view.user_settings.ping_after_message else 'after'
+                    options.append(discord.SelectOption(label=f'Change pet catch helper to {pet_helper_mode}',
+                                                        value='toggle_pet_helper_mode'))
+                    options.append(discord.SelectOption(label=f'Change ruby counter to {ruby_counter_mode}',
+                                                        value='toggle_ruby_counter_mode'))
+                    options.append(discord.SelectOption(label=f'Change training helper to {tr_helper_mode}',
+                                                        value='toggle_tr_helper_mode'))
+                    options.append(discord.SelectOption(label=f'Ping {ping_mode_setting} helper message',
+                                                        value='toggle_ping_mode'))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class SetFarmHelperModeSelect(discord.ui.Select):
+    """Select to change farm helper mode"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        for value, label in strings.FARM_HELPER_MODES.items():
+            emoji = emojis.ENABLED if view.user_settings.farm_helper_mode == value else None
+            options.append(discord.SelectOption(label=label, value=str(value), emoji=emoji))
+        super().__init__(placeholder='Change farm helper mode', min_values=1, max_values=1, options=options,
+                         custom_id='set_farm_helper_mode')
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.user_settings.update(farm_helper_mode=int(self.values[0]))
+        try:
+            reminder = await reminders.get_user_reminder(self.view.user_settings.user_id, 'farm')
+            user_command = await functions.get_farm_command(self.view.user_settings)
+            reminder_message = self.view.user_settings.alert_farm.message.replace('{command}', user_command)
+            await reminder.update(message=reminder_message)
+        except exceptions.NoDataFoundError:
+            pass
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, SetFarmHelperModeSelect):
+                    options = []
+                    for value, label in strings.FARM_HELPER_MODES.items():
+                        emoji = emojis.ENABLED if self.view.user_settings.farm_helper_mode == value else None
+                        options.append(discord.SelectOption(label=label, value=str(value), emoji=emoji))
+                    child.options = options
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ManageServerSettingsAutoFlexSelect(discord.ui.Select):
+    """Select to change auto-flex server settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        auto_flex_emoji = emojis.ENABLED if view.guild_settings.auto_flex_enabled else emojis.DISABLED
+        reminder_action = 'Disable' if view.guild_settings.auto_flex_enabled else 'Enable'
+        options.append(discord.SelectOption(label=f'{reminder_action} auto flex alerts',
+                                            value='toggle_auto_flex', emoji=auto_flex_emoji))
+        options.append(discord.SelectOption(label='Set this channel as auto flex channel',
+                                            value='set_channel', emoji=emojis.ADD))
+        options.append(discord.SelectOption(label='Reset auto flex channel',
+                                            value='reset_channel', emoji=emojis.REMOVE))
+        super().__init__(placeholder='Change settings', min_values=1, max_values=1, options=options,
+                         custom_id='manage_server_settings')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        user_global_name = interaction.user.global_name if interaction.user.global_name is not None else interaction.user.name
+        if select_value == 'toggle_auto_flex':
+            if not self.view.guild_settings.auto_flex_enabled and self.view.guild_settings.auto_flex_channel_id is None:
+                await interaction.response.send_message('You need to set an auto flex channel first.', ephemeral=True)
+                return
+            await self.view.guild_settings.update(auto_flex_enabled=not self.view.guild_settings.auto_flex_enabled)
+        elif select_value == 'set_channel':
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.blurple, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, do you want to set `{interaction.channel.name}` as the auto flex channel?',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                await self.view.guild_settings.update(auto_flex_channel_id=interaction.channel.id)
+                await confirm_interaction.edit_original_response(content='Channel updated.', view=None)
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        elif select_value == 'reset_channel':
+            if self.view.guild_settings.auto_flex_channel_id is None:
+                await interaction.response.send_message(
+                    f'You don\'t have an auto flex channel set.',
+                    ephemeral=True
+                )
+                return
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.red, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{user_global_name}**, do you want to reset the auto flex channel?\n\n'
+                f'Note that this will also disable the auto flex alerts if enabled.',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                await self.view.guild_settings.update(auto_flex_channel_id=None, auto_flex_enabled=False)
+                await confirm_interaction.edit_original_response(content='Channel reset.', view=None)
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, ManageServerSettingsAutoFlexSelect):
+                    options = []
+                    auto_flex_emoji = emojis.ENABLED if self.view.guild_settings.auto_flex_enabled else emojis.DISABLED
+                    reminder_action = 'Disable' if self.view.guild_settings.auto_flex_enabled else 'Enable'
+                    options.append(discord.SelectOption(label=f'{reminder_action} auto flex alerts',
+                                                        value='toggle_auto_flex', emoji=auto_flex_emoji))
+                    options.append(discord.SelectOption(label='Set this channel as auto flex channel',
+                                                        value='set_channel', emoji=emojis.ADD))
+                    options.append(discord.SelectOption(label='Reset auto flex channel',
+                                                        value='reset_channel', emoji=emojis.REMOVE))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.guild_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+            
+class ManageManagedMultipliersSelect(discord.ui.Select):
+    """Select to change managed multipliers"""
+    def __init__(self, view: discord.ui.DesignerView, disabled: bool = False):
+        options = []
+        options.append(discord.SelectOption(label=f'All',
+                                            value='all'))
+        for activity in strings.ACTIVITIES_WITH_CHANGEABLE_MULTIPLIER:
+            if activity == 'hunt-partner': continue
+            options.append(discord.SelectOption(label=activity.replace("-"," ").capitalize(),
+                                                value=activity))
+        super().__init__(placeholder='Change managed multipliers', min_values=1, max_values=1, options=options,
+                         custom_id='manage_managed_multipliers', disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        modal = modals.SetMultiplierModal(self.view, select_value)
+        await interaction.response.send_modal(modal)
+
+        
+class ManageManualMultipliersSelect(discord.ui.Select):
+    """Select to change manual multipliers"""
+    def __init__(self, view: discord.ui.DesignerView, disabled: bool = False):
+        options = []
+        options.append(discord.SelectOption(label='Hunt partner',
+                                            value='hunt-partner'))
+        super().__init__(placeholder='Change manual multipliers', min_values=1, max_values=1, options=options,
+                         custom_id='manage_manual_multipliers', disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        modal = modals.SetMultiplierModal(self.view, select_value)
+        await interaction.response.send_modal(modal)
+
+
+class ManageEventReductionsSelect(discord.ui.Select):
+    """Select to manage cooldowns"""
+    def __init__(self, view: discord.ui.DesignerView, all_cooldowns: list[cooldowns.Cooldown],
+                 cd_type: Literal['slash', 'text']):
+        self.all_cooldowns = all_cooldowns
+        self.cd_type = cd_type
+        options = []
+        options.append(discord.SelectOption(label=f'All',
+                                            value='all'))
+        for cooldown in all_cooldowns:
+            options.append(discord.SelectOption(label=cooldown.activity.capitalize(),
+                                                value=cooldown.activity))
+        placeholders = {
+            'slash': 'Change slash event reductions',
+            'text': 'Change text event reductions',
+        }
+        super().__init__(placeholder=placeholders[cd_type], min_values=1, max_values=1, options=options,
+                         custom_id=f'manage_{cd_type}')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        modal = modals.SetEventReductionModal(self.view, select_value, self.cd_type)
+        await interaction.response.send_modal(modal)
+
+
+class CopyEventReductionsButton(discord.ui.Button):
+    """Button to toggle the auto-ready feature"""
+    def __init__(self, style: Optional[discord.ButtonStyle], custom_id: str, label: str,
+                 disabled: bool = False, emoji: Optional[discord.PartialEmoji] = None):
+        super().__init__(style=style, custom_id=custom_id, label=label, emoji=emoji,
+                         disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        for cooldown in self.view.all_cooldowns:
+            if self.custom_id == 'copy_slash_text':
+                await cooldown.update(event_reduction_mention=cooldown.event_reduction_slash)
+            else:
+                await cooldown.update(event_reduction_slash=cooldown.event_reduction_mention)
+        embed = await self.view.embed_function(self.view.all_cooldowns)
+        if not interaction.response.is_done():
+            await interaction.response.edit_message(embed=embed, view=self.view)
+        else:
+            await self.view.message.edit(embed=embed, view=self.view)
+
+
+class ManagePortalsSelect(discord.ui.Select):
+    """Select to change portal settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        if len(view.user_portals) < 20:
+            options.append(discord.SelectOption(label=f'Add portal', emoji=emojis.ADD,
+                                                value='add_portal'))
+        for index, portal in enumerate(view.user_portals):
+            options.append(discord.SelectOption(label=f'Remove portal {index + 1} ({portal.channel_id})',
+                                                emoji=emojis.REMOVE,
+                                                value=f'remove_{portal.channel_id}'))
+        super().__init__(placeholder='Manage portals', min_values=1, max_values=1, options=options,
+                         custom_id='manage_portals')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        if select_value == 'add_portal':
+            modal = modals.AddPortalModal(self.view, ManagePortalsSelect)
+            await interaction.response.send_modal(modal)
+        else:
+            channel_id = int(select_value.replace('remove_', ''))
+            portal = await portals.get_portal(self.view.user_settings.user_id, channel_id)
+            await portal.delete()
+            self.view.user_portals.remove(portal)
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, ManagePortalsSelect):
+                    options = []
+                    if len(self.view.user_portals) < 20:
+                        options.append(discord.SelectOption(label=f'Add portal', emoji=emojis.ADD,
+                                                            value='add_portal'))
+                    for index, portal in enumerate(self.view.user_portals):
+                        options.append(discord.SelectOption(label=f'Remove portal {index + 1} ({portal.channel_id})',
+                                                            emoji=emojis.REMOVE,
+                                                            value=f'remove_{portal.channel_id}'))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings,
+                                               self.view.user_portals)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class SwitchToReadyRemindersSelect(discord.ui.Select):
+    """Select to switch to ready reminder settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        options.append(discord.SelectOption(label='Manage visible commands and command channels',
+                                            value='switch_to_ready_reminders'))
+        super().__init__(placeholder='Manage visible commands and command channels', min_values=1, max_values=1,
+                         options=options, custom_id='switch_to_ready_reminders')
+
+    async def callback(self, interaction: discord.Interaction):
+        view = views.SettingsReadyRemindersView(self.view.ctx, self.view.bot, self.view.user_settings,
+                                                self.view.clan_settings, settings_cmd.embed_settings_ready_reminders)
+        embed = await settings_cmd.embed_settings_ready_reminders(self.view.bot, self.view.ctx, self.view.user_settings,
+                                                                  self.view.clan_settings)
+        await interaction.response.edit_message(embed=embed, view=view)
+        view.interaction = interaction
+        self.view.stop()
+
+
+class ManageReadyReminderChannelsSelect(discord.ui.Select):
+    """Select to manage ready reminder channel settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        options.append(discord.SelectOption(label=f'Add arena channel', emoji=emojis.ADD,
+                                            value='add_channel_arena'))
+        options.append(discord.SelectOption(label=f'Add duel channel', emoji=emojis.ADD,
+                                            value='add_channel_duel'))
+        options.append(discord.SelectOption(label=f'Add dungeon channel', emoji=emojis.ADD,
+                                            value='add_channel_dungeon'))
+        options.append(discord.SelectOption(label=f'Add horse breed channel', emoji=emojis.ADD,
+                                            value='add_channel_horse'))
+        options.append(discord.SelectOption(label=f'Remove arena channel', emoji=emojis.REMOVE,
+                                            value='remove_channel_arena'))
+        options.append(discord.SelectOption(label=f'Remove duel channel', emoji=emojis.REMOVE,
+                                            value='remove_channel_duel'))
+        options.append(discord.SelectOption(label=f'Remove dungeon channel', emoji=emojis.REMOVE,
+                                            value='remove_channel_dungeon'))
+        options.append(discord.SelectOption(label=f'Remove horse breed channel', emoji=emojis.REMOVE,
+                                            value='remove_channel_horse'))
+        super().__init__(placeholder='Manage command channels', min_values=1, max_values=1, options=options,
+                         custom_id='manage_command_channels')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        if select_value == 'remove_channel_arena':
+            await self.view.user_settings.update(ready_channel_arena=None)
+        elif select_value == 'remove_channel_duel':
+            await self.view.user_settings.update(ready_channel_duel=None)
+        elif select_value == 'remove_channel_dungeon':
+            await self.view.user_settings.update(ready_channel_dungeon=None)
+        elif select_value == 'remove_channel_horse':
+            await self.view.user_settings.update(ready_channel_horse=None)
+        else:
+            modal = modals.AddCommandChannelModal(self.view, select_value.replace('add_channel_',''))
+            await interaction.response.send_modal(modal)
+            return
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings,
+                                               self.view.clan_settings)
+        if not interaction.response.is_done():
+            await interaction.response.edit_message(embed=embed, view=self.view)
+        else:
+            await self.view.message.edit(embed=embed, view=self.view)
+
+
+class ManagePortalSettingsSelect(discord.ui.Select):
+    """Select to change portal settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        message_style = 'embed' if view.user_settings.portals_as_embed else 'normal message'
+        spacing_emoji = emojis.ENABLED if view.user_settings.portals_spacing_enabled else emojis.DISABLED
+        options.append(discord.SelectOption(label=f'Show portal list as {message_style}',
+                                            value='toggle_message_style', emoji=None))
+        options.append(discord.SelectOption(label=f'Mobile spacing', emoji=spacing_emoji,
+                                            value='toggle_mobile_spacing'))
+        super().__init__(placeholder='Change settings', min_values=1, max_values=1, options=options,
+                         custom_id='manage_portal_settings')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        if select_value == 'toggle_mobile_spacing':
+            await self.view.user_settings.update(
+                portals_spacing_enabled=not self.view.user_settings.portals_spacing_enabled
+            )
+        elif select_value == 'toggle_message_style':
+            await self.view.user_settings.update(portals_as_embed=not self.view.user_settings.portals_as_embed)
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, ManagePortalSettingsSelect):
+                    options = []
+                    message_style = 'embed' if self.view.user_settings.portals_as_embed else 'normal message'
+                    spacing_emoji = emojis.ENABLED if self.view.user_settings.portals_spacing_enabled else emojis.DISABLED
+                    options.append(discord.SelectOption(label=f'Show portal list as {message_style}',
+                                                        value='toggle_message_style', emoji=None))
+                    options.append(discord.SelectOption(label=f'Mobile spacing', emoji=spacing_emoji,
+                                                        value='toggle_mobile_spacing'))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings,
+                                               self.view.user_portals)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ManageMultiplierSettingsSelect(discord.ui.Select):
+    """Select to change multiplier settings"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options: list[discord.SelectOption] = []
+        multiplier_management_emoji: str = emojis.ENABLED if view.user_settings.multiplier_management_enabled else emojis.DISABLED
+        options.append(discord.SelectOption(label='Automatic multipliers',
+                                                      value='multiplier_management', emoji=multiplier_management_emoji))
+        options.append(discord.SelectOption(label='Print current multipliers',
+                                                      value='print_multipliers', emoji=None))
+        super().__init__(placeholder='Change settings', min_values=1, max_values=1, options=options,
+                         custom_id='manage_multiplier_settings')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value: str = self.values[0]
+        match select_value:
+            case "multiplier_management":
+                await self.view.user_settings.update(
+                    multiplier_management_enabled=not self.view.user_settings.multiplier_management_enabled
+                )
+            case "print_multipliers":
+                answer: str = (
+                    f'```\n'
+                    f'<@{self.view.ctx.bot.user.id}> multi '
+                    f'adventure {round(self.view.user_settings.alert_adventure.multiplier, 4):g} '
+                    f'card-hand {round(self.view.user_settings.alert_card_hand.multiplier, 4):g} '
+                    f'daily {round(self.view.user_settings.alert_daily.multiplier, 4):g} '
+                    f'duel {round(self.view.user_settings.alert_duel.multiplier, 4):g} '
+                    f'epic {round(self.view.user_settings.alert_epic.multiplier, 4):g} '
+                    f'farm {round(self.view.user_settings.alert_farm.multiplier, 4):g} '
+                    f'hunt {round(self.view.user_settings.alert_hunt.multiplier, 4):g} '
+                    f'lootbox {round(self.view.user_settings.alert_lootbox.multiplier, 4):g} '
+                    f'quest {round(self.view.user_settings.alert_quest.multiplier, 4):g} '
+                    f'training {round(self.view.user_settings.alert_training.multiplier, 4):g} '
+                    f'weekly {round(self.view.user_settings.alert_weekly.multiplier, 4):g} '
+                    f'work {round(self.view.user_settings.alert_work.multiplier, 4):g} '
+                    f'\n```'
+                )
+                await interaction.response.send_message(answer, ephemeral=True)
+        for action_row in self.view.children.copy():
+            for child in action_row.children.copy():
+                if isinstance(child, ManageMultiplierSettingsSelect):
+                    options: list[discord.SelectOption] = []
+                    multiplier_management_emoji: str = emojis.ENABLED if self.view.user_settings.multiplier_management_enabled else emojis.DISABLED
+                    options.append(discord.SelectOption(label='Automatic multipliers',
+                                                        value='multiplier_management', emoji=multiplier_management_emoji))
+                    options.append(discord.SelectOption(label='Print current multipliers',
+                                                        value='print_multipliers', emoji=None))
+                    child.options = options
+                if isinstance(child, ManageManagedMultipliersSelect):
+                    select_disabled: bool = False
+                    if self.view.user_settings.multiplier_management_enabled and self.view.user_settings.current_area != 20:
+                        select_disabled = True
+                    if child.disabled != select_disabled:
+                        child.disabled = select_disabled
+        embed: discord.Embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.user_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ManageEventPingMessagesSelect(discord.ui.Select):
+    """Select to change event ping messages"""
+    def __init__(self, view: discord.ui.DesignerView):
+        options = []
+        for event, name in strings.EVENT_PINGS.items():
+            options.append(discord.SelectOption(label=name,
+                                                value=f'set_{event}_message'))
+        options.append(discord.SelectOption(label='Reset all messages',
+                                            value='reset_messages'))
+        super().__init__(placeholder='Change messages', min_values=1, max_values=1, options=options,
+                         custom_id='manage_event_messages')
+
+    async def callback(self, interaction: discord.Interaction):
+        def check(m: discord.Message) -> bool:
+            return m.author == interaction.user and m.channel == interaction.channel
+
+        select_value = self.values[0]
+        if select_value == 'reset_messages':
+            confirm_view = views.ConfirmCancelView(self.view.ctx, styles=[discord.ButtonStyle.red, discord.ButtonStyle.grey])
+            confirm_interaction = await interaction.response.send_message(
+                f'**{interaction.user.display_name}**, this will reset **all** event ping messages to the default one. '
+                f'Are you sure?',
+                view=confirm_view,
+                ephemeral=True
+            )
+            confirm_view.interaction_message = confirm_interaction
+            await confirm_view.wait()
+            if confirm_view.value == 'confirm':
+                updated_settings = {}
+                for event in strings.EVENT_PINGS.keys():
+                    updated_settings[f'event_{event}_message'] = strings.DEFAULT_MESSAGES_EVENT_PINGS[event]
+                await self.view.guild_settings.update(**updated_settings)
+                await interaction.edit_original_response(
+                    content=(
+                        f'Changed all event messages back to their default message.'
+                    ),
+                    view=None,
+                )
+                embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.guild_settings)
+                await interaction.message.edit(embed=embed, view=self.view)
+                return
+            else:
+                await confirm_interaction.edit_original_response(content='Aborted', view=None)
+                return
+        else:
+            event = re.search(r'set_(\w+)_message', select_value).group(1)
+            event_settings = getattr(self.view.guild_settings, f'event_{event}', None)
+            if event_settings is None:
+                await interaction.response.send_message(strings.MSG_ERROR)
+                embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.guild_settings)
+                await interaction.message.edit(embed=embed, view=self.view)
+                return
+            await interaction.response.send_message(
+                f'**{interaction.user.display_name}**, please send the new message for the {strings.EVENT_PINGS[event]} '
+                f'event to this channel (or `abort` to abort):',
+            )
+            try:
+                answer = await self.view.bot.wait_for('message', check=check, timeout=60)
+            except asyncio.TimeoutError:
+                await interaction.edit_original_response(content=f'**{interaction.user.display_name}**, you didn\'t answer in time.')
+                return
+            new_message = answer.content
+            if new_message.lower() in ('abort','cancel','stop'):
+                await interaction.delete_original_response(delay=3)
+                followup_message = await interaction.followup.send('Aborted.')
+                await followup_message.delete(delay=3)
+                embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.guild_settings)
+                await interaction.message.edit(embed=embed, view=self.view)
+                return
+            if len(new_message) > 800:
+                await interaction.delete_original_response(delay=5)
+                followup_message = await interaction.followup.send(
+                    'This is a command to set a new message, not to write a novel :thinking:',
+                )
+                await followup_message.delete(delay=5)
+                embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.guild_settings)
+                await interaction.message.edit(embed=embed, view=self.view)
+                return
+            await interaction.delete_original_response(delay=3)
+            updated_settings = {f'event_{event}_message': new_message}
+            await self.view.guild_settings.update(**updated_settings)
+            followup_message = await interaction.followup.send('Message updated!')
+            await followup_message.delete(delay=3)
+        embed = await self.view.embed_function(self.view.bot, self.view.ctx, self.view.guild_settings)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=self.view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class SetSeasonalEventSelect(discord.ui.Select):
+    """Seasonal Event Select"""
+    def __init__(self, seasonal_events: list[str], active_event: str, placeholder: str):
+        self.seasonal_events = seasonal_events
+        options = []
+        for event in seasonal_events:
+            label = event.replace('_',' ').title()
+            emoji = '🔹' if event == active_event else None
+            options.append(discord.SelectOption(label=label, value=event, emoji=emoji))
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options,
+                         custom_id='select_event')
+
+    async def callback(self, interaction: discord.Interaction):
+        select_value = self.values[0]
+        self.view.active_event = select_value
+        await settings_db.update_setting('seasonal_event', select_value)
+        for action_row in self.view.children.copy():
+            for child in action_row.children:
+                if child.custom_id == 'select_event':
+                    options = []
+                    for event in self.seasonal_events:
+                        label = event.replace('_',' ').title()
+                        emoji = '🔹' if event == self.view.active_event else None
+                        options.append(discord.SelectOption(label=label, value=event, emoji=emoji))
+                    child.options = options
+                    break
+        embed = await self.view.embed_function(self.view.bot)
+        await interaction.response.edit_message(embed=embed, view=self.view)
